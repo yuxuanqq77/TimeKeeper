@@ -1,0 +1,12 @@
+..\obj\myiic.o: ..\HARDWARE\24CXX\myiic.c
+..\obj\myiic.o: ..\HARDWARE\24CXX\myiic.h
+..\obj\myiic.o: ..\SYSTEM\sys\sys.h
+..\obj\myiic.o: ..\SYSTEM\sys\stm32f4xx.h
+..\obj\myiic.o: C:\Keil_v5\ARM\CMSIS\Include\core_cm4.h
+..\obj\myiic.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+..\obj\myiic.o: C:\Keil_v5\ARM\CMSIS\Include\core_cmInstr.h
+..\obj\myiic.o: C:\Keil_v5\ARM\CMSIS\Include\core_cmFunc.h
+..\obj\myiic.o: C:\Keil_v5\ARM\CMSIS\Include\core_cm4_simd.h
+..\obj\myiic.o: ..\SYSTEM\sys\system_stm32f4xx.h
+..\obj\myiic.o: C:\Keil_v5\ARM\RV31\INC\rtl.h
+..\obj\myiic.o: ..\SYSTEM\delay\delay.h

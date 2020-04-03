@@ -1,0 +1,871 @@
+#include "sys.h"
+#include "usart.h"
+#include "spi.h"
+#include "timer.h"
+#include "DIGPOT.h"
+#include "GPS.h"
+#include "delay.h"
+
+//////////////////////////////////////////////////////////////////////////
+#define TK_PREOCXO          0       		//预热状态***
+
+#define TK_IDLE             1             	//空闲状态*** 同步状态
+
+#define TK_RUNMEAS          2             	//单测量运行状态***
+#define TK_COMMEAS          3             	//单测量成功状态***
+#define TK_OVEMEAS          4             	//单测量超时状态***
+
+#define TK_RUNSYN_MEAS      5             	//同步测量段运行状态***
+#define TK_COMSYN_MEAS      6             	//同步测量段成功状态***
+#define TK_OVESYN_MEAS      7             	//同步测量段超时状态***
+
+#define TK_RUNSYN_ADJ       8             	//同步调整段运行状态***
+#define TK_COMSYN_ADJ       9             	//同步调整段完成状态***
+#define TK_OVESYN_ADJ       10				//同步调整段超时状态***
+
+#define TK_TIMKEEP          11   			//守时状态***
+//////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////
+////开始全局状态变量定义
+///////////////////////////////////////
+
+
+//////////////////////////////////////////////////////////////////////////
+//定义系统状态变量
+
+SYS_GSV		G_StaV_St ;
+
+u8			Next_SYN_Item	= 0 ;				//指向一个最老的同步或测量信息
+SYN_Info	Last_SYN_Table[5]   ;				//最近5次同步信息记录表
+
+//////////////////////////////////////////////////////////////////////////////
+
+u32     SuccTimLast 	= 0 ;        			//最后一次同步时间，记录最后一次同步的本机时间
+s32     Correct_m_Last 	= 0 ;     				//最后同步调整值
+
+u32 	PerTimer 		= MS2ON20NS(1000) - 1;  	//发射周期，以20ns为单位，默认为1s 50000000-1
+u32 	PulW_NAT1P 		= MS2ON20NS(10);   		//第1脉宽，以20ns为单位，默认为10ms
+
+u16 	SuccAdjNum 		= 0  ;          		//成功同步次数
+
+//捕获需要的变量
+u8  	AcqTimeResFlag 	= 2 ;                	//捕获测量标志
+u32 	AcqTime20ns ;                      		//捕获的时延值，以20ns为单位
+u32 	AcqTimeS;
+u32		AcqGPSTime;
+
+//调整变量
+u8  	AdjTimeResFlag 	= 2 ;      				//同步标志位
+s32 	Correct_m  		= 0;            		//同步调整值
+
+u8  	GPS_Power  		= 0;           			//GPS电源开关
+
+u8  	Timer2_OnOff 	= 1 ;         			//定时器手动打开或关闭,用于调试
+
+u32 	GPS_A_V_TimerOve		= 0 ;			//判断GPS信号是否稳定的标志变量
+u32 	GPS_A_V_TimerOve50ms 	= 0 ;
+
+
+extern u16 TemprU16;
+
+///////////////////////////////////////
+////结束全局状态变量定义
+///////////////////////////////////////
+
+u32 Device_SN0 = 0 ;
+u32 Device_SN1 = 0 ;
+u32 Device_SN2 = 0 ;
+
+//芯片串号验证锁死函数
+void Get_SerialNum(void)
+{
+	u32 Device_Serial0, Device_Serial1, Device_Serial2;
+
+	Device_Serial0 = *(vu32*)(0x1FFF7A10);      //12 Bytes Serial Number
+	Device_Serial1 = *(vu32*)(0x1FFF7A14);
+	Device_Serial2 = *(vu32*)(0x1FFF7A28);
+
+	if (Device_Serial0 != 0)
+	{
+		Device_SN0 = Device_Serial0;
+		Device_SN1 = Device_Serial1;
+		Device_SN2 = Device_Serial2;
+	}
+
+	if( Device_SN0 == 0x00280023 &&
+	        Device_SN1 == 0x30365110 &&
+	        Device_SN2 == 0x05E3F000 )
+		return;
+	else
+		while(1) {};
+}
+//
+
+//GPS电源控制初始化
+void GPS_Pow_init(void)
+{
+	RCC->AHB1ENR    |=  RCC_AHB1ENR_GPIOCEN;//使能PORTC时钟
+	POWGPS = 0 ;
+	GPIO_Set(GPIOC, PIN12, GPIO_MODE_OUT, GPIO_OTYPE_PP, GPIO_SPEED_2M, GPIO_PUPD_NONE); //
+}
+//更改GPS电源
+void GPS_Pow(u8 OnOff)
+{
+	if(OnOff)     POWGPS = 1 ;
+	else          POWGPS = 0 ;
+}
+//
+
+//调整量计算程序
+//根据周期、第1脉冲宽度，捕获时延，计算需要调整TCNT的数值及方向
+//返回有符号数，直接与TCNT相加即可
+//具体算法参见规格书中描述,还有笔记本P123/124.
+//
+s32 AdjCalc(u32 PerT, u32 AcqD, u32 PulW_NAT1P)
+{
+	u32 CPot, DPot ;                           		//C,D为两个调整阈值点,它们的引入是为了保证,在中期调整的时候
+	//不会因为调整幅度过大而马上引起第1脉冲生成,定时器溢出
+	//等错误或不良状态
+
+	u32 Tn ;                                  		//无符号捕获值坐标变换,将AcqD这个SYN信号发生在TIM2周期中的位置
+	//变换到第1脉冲前沿,发生在SYN周期中的位置.
+
+	s32 Corrm;                                		//有符号修正值,保存了最终的调整值,该值经过阈值点修正
+
+	//CPot = (PerT + 1)/2 - PulW_NAT1P - 500000 ; 	//500000 对应10ms保护距离 计算C点位置
+	//DPot = (PerT + 1)/2 - 1        + 500000 ; 	//500000 对应10ms保护距离 计算D点位置
+
+	CPot = (PerT + 1) / 2                 - 500000 ; 	//500000 对应10ms保护距离 计算C点位置
+	DPot = (PerT + 1) / 2 - 1 + PulW_NAT1P  + 500000 ; 	//500000 对应10ms保护距离 计算D点位置
+
+	Tn   = (PerT - AcqD + 1) % (PerT + 1) ;     		//计算Tn,注意若AcqD=0,有可能溢出所以使用%
+
+	if( Tn < CPot )                           		//0<Tn<C,第1脉冲前沿发生在SYN周期中的前半部分且没有达到阈值
+	{	//说明FR信号落后于SYN一小段,FR慢了,需要让FR信号快一点到,TCNT要"+"
+		Corrm = Tn ;
+	}
+	else if( Tn <= (PerT + 1) / 2 )             		//C<=Tn<=(PerT + 1)/2,第1脉冲前沿发生在SYN周期中的前半部分且达到阈值
+	{	//说明FR信号落后于SYN一大段,FR慢了,需要让FR信号快一点到,TCNT要"+",
+		Corrm = CPot ;                          	//但是又不能加太多,防止加多了,超过周期1半,向后溢出.
+	}
+	else if( Tn <= DPot )                     		//(PerT + 1)/2<Tn<=D,第1脉冲前沿发生在SYN周期中的后半部分,且在阈值之前(调整量超过阈值)
+	{	//说明FR信号超前于SYN一大段,FR快了,需要让FR信号慢一点到,TCNT要"-",
+		Corrm = -(PerT - DPot + 1) ;           		//但是又不能加太多,防止:1,超过周期1半,向前溢出;2,让TCNT落到第一脉冲期间,引发生成第一脉冲错误.
+	}
+	else                                      		//D<Tn<=N,第1脉冲前沿发生在SYN周期中的后半部分,且在阈值之后(调整量没有超过阈值)
+	{	//说明FR信号超前于SYN一小段,FR快了,需要让FR信号慢一点到,TCNT要"-",
+		Corrm = -(PerT - Tn   + 1) ;            	//因为是一小段,所以直接减去误差量,不会发生错误.
+	}
+	return Corrm ;                            		//输出修正值,有正有负,经过阈值限幅
+}
+//
+
+
+int main(void)
+{
+	u8  Temp_AcqTimeRes ;
+	u8  Temp_AdjTimeRes ;
+
+	u8  Err_Temp ;
+
+	u8 New_CMD_Flag = 0;
+	u8 New_Data[301];
+
+	u8	New_GPS_Flag = 0;
+	u8	New_GPS_Data[512];
+	u8	GPSLenTemp;
+
+	u32  SYN_TimerOveSec 	= 0; 		//同步测试使用的超时变量
+	u8   SYN_TimerOve50ms	= 0;
+
+	u8		Per1s_Flag 	= 0;			//每1s干一次的标志变量
+	float 	Tempr_f		= 0.0f;
+	float 	TemprU16_F	= 0.0f;
+
+	delay_init(10);						//这里的延时一定要加，等待晶振稳定，恒温晶振初始的几百ms需要稳定一下
+	delay_ms(500);
+	delay_ms(500);
+
+	//内部RC，25MHz，测试使用
+//    Stm32_Clock_Init_HSI(100,16,4,7);
+//    delay_init(25);			    //延时初始化
+
+	//内部RC，50MHz，测试使用
+	Stm32_Clock_Init_HSI(100, 8, 4, 7); //设置时钟,50Mhz
+	//APB1 25MHz TIM2/3/4/5/6/7 50MHz
+	//APB2 25MHz TIM1/8/9/10/11 50MHz
+
+	//恒温晶振，50MHz
+//	Stm32_Clock_Init(100,10,2,7);   	//设置时钟,50Mhz
+	//APB1 25MHz TIM2/3/4/5/6/7 50MHz
+	//APB2 25MHz TIM1/8/9/10/11 50MHz
+
+	delay_init(50);                     //延时初始化
+
+
+	G_StaV_St.RunTime         		= 0;                //运行时钟
+	G_StaV_St.RunTime_50ms  		= 0;                //200ms为单位的运行时钟
+
+	G_StaV_St.TimeKeepSTA         	= TK_IDLE ;         //主循环状态机
+	G_StaV_St.Temper              	= 0;                //当前芯片温度
+	G_StaV_St.DigPot              	= 469 ;             //数字电位器值，默认为469	*需要存储至flash
+
+	G_StaV_St.TKS_Flag       		= 0 ;               //守时稳定标识
+
+	G_StaV_St.GPS_STA             	= GPS_RNSS_OFF ; 	//GPS状态标示
+	G_StaV_St.GPS_Time            	= 0 ;               //GPS时间
+	G_StaV_St.GPS_SatN            	= 0 ;               //GPS可见星数
+	G_StaV_St.GPS_longitude       	= 0.0f;             //GPS经度
+	G_StaV_St.GPS_latitude        	= 0.0f;             //GPS纬度
+
+	G_StaV_St.NATI_Time  			= 0;				//本机1PPS时戳
+	G_StaV_St.NATI_Time_Prog  		= 0;				//本机可编程脉冲时戳
+
+	G_StaV_St.Last_SYN_Time       	= 0 ;				//上次同步时刻
+	G_StaV_St.Last_ACQ_s    		= 0 ;				//上次同步测量误差s
+	G_StaV_St.Last_ACQ_ns   		= 0 ;				//上次同步测量误差ns
+	G_StaV_St.Last_ADJ_s          	= 0 ;				//上次同步调整s
+	G_StaV_St.Last_ADJ_ns         	= 0 ;				//上次同步调整s
+
+	G_StaV_St.Auto_SYN				= 1 ;				//自同步使能					*需要存储至flash
+	G_StaV_St.Auto_OCXOADJ			= 0 ;				//自调整晶振使能				*需要存储至flash
+	G_StaV_St.Prog_Pul				= 0 ;				//可编程脉冲使能				*需要存储至flash
+	G_StaV_St.Auto_KeepSIn			= 0 ;				//自切换守时状态使能			*需要存储至flash
+	G_StaV_St.Meas_Pul				= 0 ;				//测量功能使能				*需要存储至flash
+	G_StaV_St.Prog_PerT				= MS2ON20NS(1600) - 1; //可编程脉冲周期				*需要存储至flash
+
+	G_StaV_St.Messa_SYN				= 1 ;				//同步信息输出使能			*需要存储至flash
+	G_StaV_St.Messa_1PPS			= 1 ;				//本机秒脉冲信息使能			*需要存储至flash
+	G_StaV_St.Messa_PGP				= 0 ;				//可编程脉冲信息使能			*需要存储至flash
+	G_StaV_St.Messa_GPS				= 1 ;				//GPS 报文转发使能 			*需要存储至flash
+
+	//GPS秒脉冲的门控信号，软件中使用软开关，所以两个门信号均打开
+	//GPS秒脉冲门控
+	RCC->AHB1ENR  |= RCC_AHB1ENR_GPIOCEN;											//使能PORTC时钟
+	GPIO_Set(GPIOC, PIN10, GPIO_MODE_OUT, GPIO_OTYPE_PP, GPIO_SPEED_2M, GPIO_PUPD_NONE); //
+	GATEGPSPPS = 0 ;
+	GATEGPSPPS = 1 ;
+
+	//初始化恒温晶振压控数字电位器
+	DIGPOT_Init();
+	DIGPOT_Write(G_StaV_St.DigPot);
+
+	//初始化GPS时钟，这里为了调试方便默认打开
+	GPS_Pow_init();
+	GPS_Power	=	0 ;
+	GPS_Pow(GPS_Power);
+
+	LED_Init();
+
+	Temper_Adc_Init();
+	delay_ms(250);
+
+	//运行时钟初始化
+	TIM6_50ms_Init();
+
+	//初始化和主控单片机的串口，这里主要用于测试硬件，不是完整程序,不是完整的协议
+	UART6_SYS_init(25, 115200);
+	Send_STA_Sys();
+
+	//初始化GPS串口
+	UART1_GPS_init(25, 4800);
+
+	//初始化主计数器TIM2
+	TIM2_KEEP_Init(PerTimer, PulW_NAT1P);				//初始化定时器2，主定时器，这个定时器维护着本机1s脉冲，NAT1S
+
+	delay_ms(250);   									//在进入主循环之前，再演示250ms，稳定一下
+
+	SYSSTALED	=	LED_Flash_1s;						//两个LED的用法演示,只要设置想要的闪烁速度就行了
+	TKPSTALED	= 	LED_Flash_2s;
+
+	while(1)											//主循环从此处开始
+	{
+		//每秒更新一次,主要是ADC电压采集转成其他物理量，后面可能还要增加
+		if( G_StaV_St.RunTime_50ms >= 9 && Per1s_Flag == 0 )
+		{
+			Per1s_Flag = 1;														//确保，每一秒，只会进入一次
+
+			TemprU16_F    		= 	((TemprU16) * 3.3139f / 4095 - 0.76f) * 400 + 25;	//这里是把二进制采样数据转换为温度数据
+			Tempr_f         	=  	0.5f * Tempr_f   + 0.5f * TemprU16_F ;			//这里完成了一次滤波操作
+			G_StaV_St.Temper	=	(s16)(Tempr_f * 10);							//×10取整，做成S16存储，需要的时候，÷10就是摄氏度
+		}
+
+		if( G_StaV_St.GPS_STA != GPS_RNSS_OFF )									//这里处理GPS相关的报文，如果GPS时关机的，就不处理了
+		{
+			Proc_RxByte_GPS();													//处理GPS原始报文
+			New_GPS_Flag 	= Proc_RxCMD_GPS(New_GPS_Data);						//取出一个最老的报文
+
+			if( New_GPS_Flag	!=	0 )											//如果有新的GPS报文到来
+			{
+				GPSLenTemp 		= 	New_GPS_Data[0] ;
+				New_GPS_Data[0]	=	'$' ;
+				Prorc_RNSS_GPS_RMC_GSV( New_GPS_Data );							//处理GPS报文，包括状态，时间，星数等等信息
+
+				New_GPS_Data[0] = GPSLenTemp ;
+
+				if( G_StaV_St.Messa_GPS == 1 )									//如果打开GPS转发使能
+				{
+					if(New_GPS_Flag == 'C')										//RMC转发全文
+					{
+						//转发GPS报文
+						Send_GPS_C_V(New_GPS_Data);
+					}
+					else if( New_GPS_Flag == 'V' && New_GPS_Data[9] == '1')		//GSV只转发第1条
+					{
+						//转发GPS报文
+						Send_GPS_C_V(New_GPS_Data);
+					}
+				}
+				New_GPS_Flag = 0 ;
+			}
+		}
+
+		//处理原始的接收缓冲区未处理字节
+		//解析出有效接收帧
+		Proc_RxByte_SYS();
+
+		//取出最老的一个接收有效帧
+		New_CMD_Flag = Proc_RxCMD_SYS(New_Data);
+
+		if(New_CMD_Flag == 'T')
+		{
+			New_CMD_Flag = 0 ;
+			//上位机查询状态
+			Send_STA_Sys();
+		}
+
+		//处理串口发送事务,如果有有效帧需要发送且发送DMA没有在工作,
+		//那么把最老的一帧使用DMA发送出去.否则直接退出.
+		Proc_TxFrame_SYS();
+
+		//主循环的状态机从此开始
+		switch(G_StaV_St.TimeKeepSTA)
+		{
+		case TK_PREOCXO:
+
+			break;
+
+		case TK_IDLE:                                  		//空闲状态***文档中称为“同步状态”
+
+			if(New_CMD_Flag == 'P')
+			{
+				//先验证参数是否争取
+				//Err_Temp = Check_Para(New_Data); 			//这一步很重要，要判断，传递过来的参数是否完全正确
+				New_CMD_Flag 	= 0;
+			}
+
+			if(New_CMD_Flag == 'M')           				//同步脉冲相对时延测量,单测量
+			{
+				New_CMD_Flag 	= 0;
+				AcqTimeResFlag 	= 0 ;            			//初始化测量标志位
+				TIM2_Meas_Start();              			//启动测量序列
+				G_StaV_St.TimeKeepSTA = TK_RUNMEAS ;      	//进入单测量同步脉冲相对时延状态
+			}
+
+			if(New_CMD_Flag == 'S')           				//主计数器同步,先测量再同步
+			{
+				New_CMD_Flag 	= 0 ;              			//归零
+				AcqTimeResFlag 	= 0 ;						//初始化测量标志位
+				TIM2_Meas_Start();              			//启动测量序列
+				G_StaV_St.TimeKeepSTA = TK_RUNSYN_MEAS ;  	//进入测量并同步中的测量状态,测量段
+			}
+
+			//满足，同步或测量条件时，开始一次测量或者同步操作
+			if( G_StaV_St.Auto_SYN == 1 && G_StaV_St.GPS_STA == GPS_RNSS_A )
+			{
+				//这里启动一次  同步并测量
+				if( (G_StaV_St.GPS_Time % 86400) % (1200 / 10) == (1200 - 10) / 10 				//满足同步条件的秒脉冲即将发生,2min(60s)的整倍数，的前一秒
+				        //	  && AcqTimeResFlag == 2                                 			//当前不在同步测量
+				        //	  && AdjTimeResFlag == 2											//当前不在同步调整
+				        && G_StaV_St.GPS_Time >= (G_StaV_St.Last_SYN_Time + (12000 - 10) / 10) 	//当前的GPS时间比上次同步时间多一个同步周期少1s,防止多次进入同步
+				        && CheckTimerOve(SYN_TimerOveSec, SYN_TimerOve50ms) == 1 				//上次同步结束2s以上,才可进入同步
+				  )
+				{
+					AcqGPSTime		= G_StaV_St.GPS_Time + 1;	//下一个GPS秒脉冲的时间戳，正常情况，这下一个秒脉冲的前沿就是我们要用来同步的脉冲
+					AcqTimeResFlag 	= 0 ;						//初始化测量标志位
+					TIM2_Meas_Start();              			//启动测量序列
+					G_StaV_St.TimeKeepSTA = TK_RUNSYN_MEAS ;  	//进入测量并同步中的测量状态,测量段
+				}
+			}
+			else if( G_StaV_St.Auto_SYN == 0 && G_StaV_St.GPS_STA == GPS_RNSS_A )		//只测量，不同步
+			{
+				//这里启动一次  单测量
+				if( (G_StaV_St.GPS_Time % 86400) % (1200 / 10) == (1200 - 10) / 10 				//满足同步条件的秒脉冲即将发生,2min(60s)的整倍数，的前一秒
+				        //	  && AcqTimeResFlag == 2                                 			//当前不在同步测量
+				        //	  && AdjTimeResFlag == 2											//当前不在同步调整
+				        && G_StaV_St.GPS_Time >= (G_StaV_St.Last_SYN_Time + (12000 - 10) / 10) 	//当前的GPS时间比上次同步时间多一个同步周期少1s,防止多次进入同步
+				        && CheckTimerOve(SYN_TimerOveSec, SYN_TimerOve50ms) == 1 				//上次同步结束2s以上,才可进入同步
+				  )
+				{
+					AcqGPSTime		= G_StaV_St.GPS_Time + 1;	//下一个GPS秒脉冲的时间戳，正常情况，这下一个秒脉冲的前沿就是我们要用来测量的脉冲
+					AcqTimeResFlag = 0 ;            			//初始化测量标志位
+					TIM2_Meas_Start();              			//启动测量序列
+					G_StaV_St.TimeKeepSTA = TK_RUNMEAS ;      	//进入单测量同步脉冲相对时延状态
+				}
+			}
+
+			break;
+
+		case TK_TIMKEEP:
+
+			break;
+
+		case TK_RUNMEAS:                        		//单测量运行状态***
+
+			//在这个状态下，等到测量到时延或者超时
+			Temp_AcqTimeRes = AcqTimeResFlag ;    		//取出变量,防止在if语句中出现变量被中断修改的错误
+
+			if( Temp_AcqTimeRes == 1 )            		//测量成功
+			{
+				G_StaV_St.TimeKeepSTA = TK_COMMEAS ;
+			}
+			else if( Temp_AcqTimeRes == 2 )       		//测量超时
+			{
+				G_StaV_St.TimeKeepSTA = TK_OVEMEAS ;
+			}
+			else if( Temp_AcqTimeRes == 0 )       		//测量进行中
+				G_StaV_St.TimeKeepSTA = TK_RUNMEAS ;
+			else
+			{
+				//异常，报错，退回空闲
+				Err_Temp = 2;
+				Send_Err('M', &Err_Temp, 1);
+				G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			}
+
+			break;
+
+		case TK_COMMEAS:                        	//单测量完成状态***
+
+			//上报结果
+			//Send_Meas_Res(AcqTime20ns);
+
+			G_StaV_St.Last_SYN_Time						=	AcqGPSTime ;		//上次同步时刻
+			G_StaV_St.Last_ACQ_s						=	AcqTimeS ;			//上次同步测量s
+			G_StaV_St.Last_ACQ_ns						=	AcqTime20ns ;		//上次同步测量ns
+			G_StaV_St.Last_ADJ_s						=	0 ;					//上次同步调整s,没有调整，只是测量，这里写0
+			G_StaV_St.Last_ADJ_ns						=	0 ;					//上次同步调整s
+
+			Last_SYN_Table[Next_SYN_Item].SYN_Time		=	AcqGPSTime ;		//上次同步时刻
+			Last_SYN_Table[Next_SYN_Item].ACQ_s			=	AcqTimeS ;			//上次同步测量捕获s
+			Last_SYN_Table[Next_SYN_Item].ACQ_ns		=	AcqTime20ns ;		//上次同步测量捕获ns
+			Last_SYN_Table[Next_SYN_Item].ADJ_s			=	0 ;					//上次同步调整s
+			Last_SYN_Table[Next_SYN_Item].ADJ_ns		=	0 ;					//上次同步调整s
+			Next_SYN_Item++;
+			Next_SYN_Item %= 5;
+
+			SYN_TimerOve50ms	= G_StaV_St.RunTime_50ms ;    					//收到结果后2秒内不再进入同步过程
+			SYN_TimerOveSec 	= G_StaV_St.RunTime + 2;                			//主要是防止,同步调整很快就结束,错误进入第二次同步序列
+
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			
+			break;
+
+		case TK_OVEMEAS:                        	//单测量超时状态***
+			//上报错误超时
+			Err_Temp = 1;
+			Send_Err('M', &Err_Temp, 1);
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+		
+			break;
+
+		case TK_RUNSYN_MEAS:                    	//同步测量段运行状态***
+
+			//在这个状态下，等到测量到时延或者超时
+			Temp_AcqTimeRes = AcqTimeResFlag ;    	//取出变量,防止在if语句中出现变量被中断修改的错误
+
+			if( Temp_AcqTimeRes == 1)
+			{
+				G_StaV_St.TimeKeepSTA = TK_COMSYN_MEAS ;
+			}
+			else if( Temp_AcqTimeRes == 2)
+			{
+				G_StaV_St.TimeKeepSTA = TK_OVESYN_MEAS ;
+			}
+			else if( Temp_AcqTimeRes == 0 )
+				G_StaV_St.TimeKeepSTA = TK_RUNSYN_MEAS ;
+			else
+			{
+				//异常，报错，退回空闲
+				Err_Temp = 2;
+				Send_Err('S', &Err_Temp, 1);
+				G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			}
+			break;
+
+		case TK_COMSYN_MEAS:                    					//同步测量段完成状态***
+
+			//根据测量结果，计算调整数值
+			Correct_m = AdjCalc(PerTimer, AcqTime20ns, PulW_NAT1P);	//根据捕获值计算调整量
+
+			//打开调整序列程序
+			AdjTimeResFlag = 0 ;
+			TIM2_Adj_Start();
+
+			G_StaV_St.TimeKeepSTA = TK_RUNSYN_ADJ ;           		//进入调整状态
+			break;
+
+		case TK_OVESYN_MEAS:                        				//同步测量段超时状态***
+			//上报错误超时
+			Err_Temp = 1;
+			Send_Err('S', &Err_Temp, 1);								//测量段超时
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			break;
+
+		case TK_RUNSYN_ADJ:                         				//同步调整段运行状态***
+
+			//在这个状态下，等到调整结束或者超时
+			Temp_AdjTimeRes = AdjTimeResFlag ;      				//取出变量,防止在if语句中出现变量被中断修改的错误
+
+			if( Temp_AdjTimeRes == 1)//调整结束
+			{
+				G_StaV_St.TimeKeepSTA = TK_COMSYN_ADJ ;
+			}
+			else if( Temp_AdjTimeRes == 2)
+			{
+				G_StaV_St.TimeKeepSTA = TK_OVESYN_ADJ ;
+			}
+			else if( Temp_AdjTimeRes == 0)
+				G_StaV_St.TimeKeepSTA = TK_RUNSYN_ADJ ;
+			else
+			{
+				//异常，报错，退回空闲
+				Err_Temp = 3;
+				Send_Err('S', &Err_Temp, 1);			//调整段异常
+				G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			}
+			break;
+
+		case TK_COMSYN_ADJ:                         //同步调整段成功状态***
+
+			//上报结果，包括测量和调整数值
+			//Send_Meas_Adj_Res(AcqTime20ns,Correct_m);
+
+			//成功同步次数
+			/*
+							SuccTimLast = G_StaV_St.RunTime;     	//最后一次同步时间，记录最后一次同步的本机时间,
+																	//这个精度不高,只是用做守时误差判读
+							Correct_m_Last = Correct_m ;            //最后同步调整值,这个值可用来判断恒温晶振是否
+																	//已经稳定,守时精度是否满足指标要求
+			*/
+			G_StaV_St.Last_SYN_Time			=	AcqGPSTime ;					//上次同步时刻
+			G_StaV_St.Last_ACQ_s			=	AcqTimeS ;						//上次同步测量s
+			G_StaV_St.Last_ACQ_ns			=	AcqTime20ns ;					//上次同步测量ns
+			G_StaV_St.Last_ADJ_s			=	AcqGPSTime ;					//上次同步调整s，这里是直接设置成GPS的时间，为了简单和与之前代码兼容
+			G_StaV_St.Last_ADJ_ns			=	Correct_m ;						//上次同步调整s
+
+			Last_SYN_Table[Next_SYN_Item].SYN_Time		=	AcqGPSTime ;		//上次同步时刻
+			Last_SYN_Table[Next_SYN_Item].ACQ_s			=	AcqTimeS ;			//上次同步测量捕获s
+			Last_SYN_Table[Next_SYN_Item].ACQ_ns		=	AcqTime20ns ;		//上次同步测量捕获ns
+			Last_SYN_Table[Next_SYN_Item].ADJ_s			=	AcqGPSTime;			//上次同步调整s
+			Last_SYN_Table[Next_SYN_Item].ADJ_ns		=	Correct_m;			//上次同步调整s
+			Next_SYN_Item++;
+			Next_SYN_Item %= 5;
+
+			SYN_TimerOve50ms	= G_StaV_St.RunTime_50ms ;    					//收到结果后2秒内不再进入同步过程
+			SYN_TimerOveSec 	= G_StaV_St.RunTime + 2;                			//主要是防止,同步调整很快就结束,错误进入第二次同步序列
+
+			SuccAdjNum ++  ;
+
+			G_StaV_St.TimeKeepSTA 			= 	TK_IDLE ;
+
+			Send_STA_Sys();                         //更新状态
+			break;
+
+		case TK_OVESYN_ADJ:                         //同步调整段超时状态***
+			//上报错误超时
+			Err_Temp = 4;
+			Send_Err('S', &Err_Temp, 1);            //调整段超时
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			break;
+
+		default:                                    //未定义的状态***
+
+			//上报未知状态错误
+			Err_Temp = 1;
+			Send_Err('Q', &Err_Temp, 1);            //未知状态错误
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+
+			break;
+		}
+
+		//更新1s标志变量，在这里清零1次后，这一秒不会再进入了
+		if( G_StaV_St.RunTime_50ms == 0 && ( Per1s_Flag == 1 ) )
+		{
+			Per1s_Flag = 0 ;
+		}
+	}
+
+//////////////////////////////////////////////////////////////
+//这里以下是之前的测试代码，用于移植代码，会产生警告
+
+	//获取守时单片机串号唯一码,与程序不一致则锁死
+	//Get_SerialNum();
+
+	while(1)
+	{
+		Proc_RxByte_GPS();
+		New_GPS_Flag = Proc_RxCMD_GPS(New_GPS_Data);
+
+		if( 1 )
+		{
+			if(New_GPS_Flag == 'C')//RMC转发全文
+			{
+				//转发GPS报文
+				Send_GPS_C_V(New_GPS_Data);
+			}
+			else if( New_GPS_Flag == 'V' && New_GPS_Data[9] == '1') //GSV只转发第1条
+			{
+				//转发GPS报文
+				Send_GPS_C_V(New_GPS_Data);
+			}
+		}
+		New_GPS_Flag = 0 ;
+
+		//处理原始的接收缓冲区未处理字节
+		//解析出有效接收帧
+		Proc_RxByte_SYS();
+
+		//取出最老的一个接收有效帧
+		New_CMD_Flag = Proc_RxCMD_SYS(New_Data);
+
+		//处理串口发送事务,如果有有效帧需要发送且发送DMA没有在工作,
+		//那么把最老的一帧使用DMA发送出去.否则直接退出.
+		Proc_TxFrame_SYS();
+
+		//过滤和SIG状态无关的命令
+		//过滤状态查询指令T
+		if(New_CMD_Flag == 'T')
+		{
+			Send_STA_Sys();
+			New_CMD_Flag = 0 ;
+		}
+
+		//过滤单纯只设置恒温晶振压控值
+		if(New_CMD_Flag == 'O')
+		{
+			if( *((u16*)(&New_Data[0])) <= 1023 && *((u16*)(&New_Data[0])) >= 10 )
+			{
+				G_StaV_St.DigPot = *((u16*)(&New_Data[0])) ;  //数字电位器值，默认为469
+
+				DIGPOT_Write(G_StaV_St.DigPot);
+				Send_STA_Sys();                     //考虑到这个指令用的不多,所以直接回复状态,
+				//刷新主控单片机中的守时单片机状态映像
+			}
+			else
+			{
+				Err_Temp = 2;
+				Send_Err('O', &Err_Temp, 2);        //超过最大时延增量,报错1
+			}
+			New_CMD_Flag = 0 ;
+		}
+
+		//软件版本号
+		if(New_CMD_Flag == 'V')
+		{
+			Send_SoftVer();
+			New_CMD_Flag = 0 ;
+		}
+
+		//软件版本号
+		if(New_CMD_Flag == 'Z')
+		{
+			Send_SIGID();
+			New_CMD_Flag = 0 ;
+		}
+
+		//打开或关闭TIM2用于测试同步对时
+		if(New_CMD_Flag == 'K')
+		{
+			if(Timer2_OnOff == 0) Timer2_OnOff = 1;
+			else                  Timer2_OnOff = 0;
+			TIM2_ONOFF( Timer2_OnOff );
+			New_CMD_Flag = 0 ;
+		}
+
+		//主循环状态机开始
+		switch(G_StaV_St.TimeKeepSTA)
+		{
+		case TK_IDLE:                                                   //空闲状态***同步状态
+
+			if(New_CMD_Flag == 'P')
+			{
+				//先验证参数是否争取
+				Err_Temp = Check_Para(New_Data);                        //这一步很重要，要判断，传递过来的参数是否完全正确
+
+				New_CMD_Flag = 0;
+			}
+
+			if(New_CMD_Flag == 'M')           //同步脉冲相对时延测量,单测量
+			{
+				New_CMD_Flag = 0;
+
+				AcqTimeResFlag = 0 ;            //初始化测量标志位
+				TIM2_Meas_Start();              //启动测量序列
+				G_StaV_St.TimeKeepSTA = TK_RUNMEAS ;      //进入单测量同步脉冲相对时延状态
+			}
+
+			if(New_CMD_Flag == 'S')           //主计数器同步,先测量再同步
+			{
+				New_CMD_Flag = 0 ;              //归零
+
+				AcqTimeResFlag = 0 ;            //初始化测量标志位
+				TIM2_Meas_Start();              //启动测量序列
+				G_StaV_St.TimeKeepSTA = TK_RUNSYN_MEAS ;  //进入测量并同步中的测量状态,测量段
+			}
+
+			break;
+
+		case TK_RUNMEAS:                        //单测量运行状态***
+
+			//在这个状态下，等到测量到时延或者超时
+			Temp_AcqTimeRes = AcqTimeResFlag ;    //取出变量,防止在if语句中出现变量被中断修改的错误
+
+			if( Temp_AcqTimeRes == 1 )            //测量成功
+			{
+				G_StaV_St.TimeKeepSTA = TK_COMMEAS ;
+			}
+			else if( Temp_AcqTimeRes == 2 )       //测量超时
+			{
+				G_StaV_St.TimeKeepSTA = TK_OVEMEAS ;
+			}
+			else if( Temp_AcqTimeRes == 0 )       //测量进行中
+				G_StaV_St.TimeKeepSTA = TK_RUNMEAS ;
+			else
+			{
+				//异常，报错，退回空闲
+				Err_Temp = 2;
+				Send_Err('M', &Err_Temp, 1);
+				G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			}
+
+			break;
+
+		case TK_COMMEAS:                        //单测量完成状态***
+			//上报结果
+			Send_Meas_Res(AcqTime20ns);
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			break;
+
+		case TK_OVEMEAS:                        //单测量超时状态***
+			//上报错误超时
+			Err_Temp = 1;
+			Send_Err('M', &Err_Temp, 1);
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			break;
+
+		case TK_RUNSYN_MEAS:                    //同步测量段运行状态***
+
+			//在这个状态下，等到测量到时延或者超时
+			Temp_AcqTimeRes = AcqTimeResFlag ;    //取出变量,防止在if语句中出现变量被中断修改的错误
+
+			if( Temp_AcqTimeRes == 1)
+			{
+				G_StaV_St.TimeKeepSTA = TK_COMSYN_MEAS ;
+			}
+			else if( Temp_AcqTimeRes == 2)
+			{
+				G_StaV_St.TimeKeepSTA = TK_OVESYN_MEAS ;
+			}
+			else if( Temp_AcqTimeRes == 0 )
+				G_StaV_St.TimeKeepSTA = TK_RUNSYN_MEAS ;
+			else
+			{
+				//异常，报错，退回空闲
+				Err_Temp = 2;
+				Send_Err('S', &Err_Temp, 1);
+				G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			}
+			break;
+
+		case TK_COMSYN_MEAS:                    //同步测量段完成状态***
+
+			//根据测量结果，计算调整数值
+			Correct_m = AdjCalc(PerTimer, AcqTime20ns, PulW_NAT1P); //根据捕获值计算调整量
+
+			//打开调整序列程序
+			AdjTimeResFlag = 0 ;
+			TIM2_Adj_Start();
+
+			G_StaV_St.TimeKeepSTA = TK_RUNSYN_ADJ ;           //进入调整状态
+			break;
+
+		case TK_OVESYN_MEAS:                        //同步测量段超时状态***
+			//上报错误超时
+			Err_Temp = 1;
+			Send_Err('S', &Err_Temp, 1);            //测量段超时
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			break;
+
+		case TK_RUNSYN_ADJ:                         //同步调整段运行状态***
+
+			//在这个状态下，等到调整结束或者超时
+			Temp_AdjTimeRes = AdjTimeResFlag ;      //取出变量,防止在if语句中出现变量被中断修改的错误
+
+			if( Temp_AdjTimeRes == 1)//调整结束
+			{
+				G_StaV_St.TimeKeepSTA = TK_COMSYN_ADJ ;
+			}
+			else if( Temp_AdjTimeRes == 2)
+			{
+				G_StaV_St.TimeKeepSTA = TK_OVESYN_ADJ ;
+			}
+			else if( Temp_AdjTimeRes == 0)
+				G_StaV_St.TimeKeepSTA = TK_RUNSYN_ADJ ;
+			else
+			{
+				//异常，报错，退回空闲
+				Err_Temp = 3;
+				Send_Err('S', &Err_Temp, 1);        //调整段异常
+				G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			}
+			break;
+
+		case TK_COMSYN_ADJ:                         //同步调整段成功状态***
+
+			//上报结果，包括测量和调整数值
+			Send_Meas_Adj_Res(AcqTime20ns, Correct_m);
+
+			SuccAdjNum ++  ;                        //成功同步次数
+
+			SuccTimLast = G_StaV_St.RunTime;     	//最后一次同步时间，记录最后一次同步的本机时间,
+			//这个精度不高,只是用做守时误差判读
+			Correct_m_Last = Correct_m ;            //最后同步调整值,这个值可用来判断恒温晶振是否
+			//已经稳定,守时精度是否满足指标要求
+
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			Send_STA_Sys();                         //更新状态
+			break;
+
+		case TK_OVESYN_ADJ:                         //同步调整段超时状态***
+
+			//上报错误超时
+			Err_Temp = 4;
+			Send_Err('S', &Err_Temp, 1);            //调整段超时
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+			break;
+
+		default:                                    //未定义的状态***
+
+			//上报未知状态错误
+			Err_Temp = 1;
+			Send_Err('Q', &Err_Temp, 1);            //未知状态错误
+			G_StaV_St.TimeKeepSTA = TK_IDLE ;
+
+			break;
+		}
+
+		//过滤状态机中不处理的未知命令
+		//没有响应的命令，或不在状态
+		if(New_CMD_Flag != 0)
+		{
+			Err_Temp = 1 ;
+			Send_Err(New_CMD_Flag, &Err_Temp, 1);
+			New_CMD_Flag = 0 ;
+		}
+	}
+}
+//
+
+
